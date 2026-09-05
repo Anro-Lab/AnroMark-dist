@@ -121,7 +121,7 @@ jobs:
             "${TAG}" "${REASON}" \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
           gh issue create \
-            --repo Anro-Lab/AnroOne-Pro-Launcher \
+            --repo Anro-Lab/AnroMark-win \
             --title "Audit FAIL on dist tag ${TAG}" \
             --body "${body}" || true
           if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then

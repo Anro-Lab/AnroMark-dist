@@ -88,7 +88,7 @@ jobs:
           body=$(printf 'audit-self-test failed in dist repo. A metamorphic invariant was violated, meaning the audit gate is no longer trustworthy.\n\nWorkflow run: %s/%s/actions/runs/%s\n\n`audit-and-publish` will refuse to publish anything until self-test passes again.' \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
           gh issue create \
-            --repo Anro-Lab/AnroOne-Pro-Launcher \
+            --repo Anro-Lab/AnroMark-win \
             --title "AUDIT-WORKFLOW-BROKEN dist repo alarm" \
             --label "critical" \
             --body "${body}" || true

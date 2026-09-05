@@ -1,7 +1,7 @@
-# gitleaks config for anroone-pro-dist audit gate.
+# gitleaks config for AnroMark-dist audit gate.
 # Extends gitleaks default ruleset and adds custom Firebase / service-account rules.
 
-title = "anroone-pro-dist audit gitleaks config"
+title = "AnroMark-dist audit gitleaks config"
 
 [extend]
 useDefault = true
