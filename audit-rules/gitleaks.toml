@@ -35,7 +35,7 @@ paths = [
   '''resources/backend/docker-compose-templates/.*''',
   # app.asar is a compiled Electron binary archive. Its binary sections produce
   # false-positive aws-access-token matches. Source secrets are caught by
-  # AI-Desktop CI and the forbidden-paths gate; trufflehog (verified-only) runs
+  # AnroMark CI and the forbidden-paths gate; trufflehog (verified-only) runs
   # separately and covers the text sections of the asar.
   '''.*\.asar$'''
 ]

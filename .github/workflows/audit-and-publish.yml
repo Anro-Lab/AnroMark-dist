@@ -117,7 +117,7 @@ jobs:
           set -u
           echo "::error::audit FAIL reason=${REASON}; deleting draft ${TAG}"
           gh release delete "${TAG}" --repo "${{ github.repository }}" --cleanup-tag --yes || true
-          body=$(printf 'Dist repo audit gate rejected tag `%s`.\n\nReason: `%s`\n\nWorkflow run: %s/%s/actions/runs/%s\n\nDraft release was deleted and tag cleaned up. AI-Desktop CI must re-tag and re-push after fixing the artifact.' \
+          body=$(printf 'Dist repo audit gate rejected tag `%s`.\n\nReason: `%s`\n\nWorkflow run: %s/%s/actions/runs/%s\n\nDraft release was deleted and tag cleaned up. AnroMark CI must re-tag and re-push after fixing the artifact.' \
             "${TAG}" "${REASON}" \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
           gh issue create \
