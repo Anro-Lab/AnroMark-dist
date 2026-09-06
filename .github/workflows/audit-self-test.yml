@@ -18,7 +18,7 @@ jobs:
   size-policy-unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v5.0.0
       - name: Run size_policy_test.sh
         run: bash audit-rules/size_policy_test.sh
 
@@ -41,7 +41,7 @@ jobs:
             zip: audit-rules/fixtures/dirty-env.zip
             expected: FAIL
     steps:
-      - uses: actions/checkout@v4.2.2
+      - uses: actions/checkout@v5.0.0
 
       - name: Unpack fixture
         id: unpack
