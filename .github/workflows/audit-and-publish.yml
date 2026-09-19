@@ -30,10 +30,11 @@ jobs:
     env:
       TAG: ${{ github.event.client_payload.tag || inputs.tag }}
       SRC_REPO: Anro-Lab/AnroMark-win
-      DRY_RUN: ${{ github.event.client_payload.dry_run || inputs.dry_run || false }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Validate inputs
+        env:
+          REQUESTED_DRY_RUN: ${{ github.event.client_payload.dry_run || inputs.dry_run || false }}
         run: |
           if [ -z "${TAG:-}" ]; then
             echo "::error::no tag supplied via client_payload.tag or inputs.tag"
@@ -43,11 +44,17 @@ jobs:
             v[0-9]*.[0-9]*.[0-9]*) : ;;
             *) echo "::error::refusing unexpected tag shape: ${TAG}"; exit 1 ;;
           esac
+          # Resolved once, here, and written unconditionally to $GITHUB_ENV — DRY_RUN
+          # is deliberately NOT also declared as a job-level env var (a job-level env
+          # entry would compete with this $GITHUB_ENV write for the same name in later
+          # steps), so the "-"-suffixed-tag safety net below cannot be silently discarded.
+          DRY="${REQUESTED_DRY_RUN}"
           if printf '%s' "${TAG}" | grep -q -- '-'; then
-            echo "DRY_RUN=true" >> "$GITHUB_ENV"
+            DRY=true
             echo "::notice::tag ${TAG} looks like a pre-release/test tag; forcing dry_run=true regardless of caller"
           fi
-          echo "auditing tag=${TAG} src=${SRC_REPO} dry_run=${DRY_RUN}"
+          echo "DRY_RUN=${DRY}" >> "$GITHUB_ENV"
+          echo "auditing tag=${TAG} src=${SRC_REPO} dry_run=${DRY}"
 
       - name: Guard - check audit self-test status (fail-closed)
         run: |
@@ -169,16 +176,16 @@ jobs:
           REPO="${{ github.repository }}"
           echo "::error::audit FAIL reason=${REASON} tag=${TAG}"
 
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "::warning::DRY RUN — audit FAILed for ${TAG}; leaving dist untouched (no delete), suppressing issue/Discord notification"
+            exit 1
+          fi
+
           state=$(gh release view "${TAG}" --repo "${REPO}" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)
           if [ "${state}" = "true" ]; then
             gh release delete "${TAG}" --repo "${REPO}" --cleanup-tag --yes || true
           else
             echo "no dist draft to clean up (state=${state})"
-          fi
-
-          if [ "${DRY_RUN}" = "true" ]; then
-            echo "::warning::DRY RUN — suppressing issue/Discord notification"
-            exit 1
           fi
 
           body=$(printf 'Dist audit gate rejected `%s`.\n\nReason: `%s`\n\nAudit run: %s/%s/actions/runs/%s\nSource release: %s/%s/releases/tag/%s\n\nNothing was published to AnroMark-dist. Fix the artifact, then re-cut the release on AnroMark-win (or re-run: `gh workflow run audit-and-publish.yml --repo %s -f tag=%s`).' \
