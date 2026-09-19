@@ -9,26 +9,52 @@ on:
         description: 'Release tag to audit and publish (must be an existing draft release)'
         required: true
         type: string
+      dry_run:
+        description: 'Audit only — never create/publish anything in dist'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
   issues: write
   actions: read
 
+concurrency:
+  group: audit-and-publish-${{ github.event.client_payload.tag || inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   audit:
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+      SRC_REPO: Anro-Lab/AnroMark-win
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Validate inputs
+        env:
+          REQUESTED_DRY_RUN: ${{ github.event.client_payload.dry_run || inputs.dry_run || false }}
         run: |
           if [ -z "${TAG:-}" ]; then
             echo "::error::no tag supplied via client_payload.tag or inputs.tag"
             exit 1
           fi
-          echo "auditing tag=${TAG}"
+          case "${TAG}" in
+            v[0-9]*.[0-9]*.[0-9]*) : ;;
+            *) echo "::error::refusing unexpected tag shape: ${TAG}"; exit 1 ;;
+          esac
+          # Resolved once, here, and written unconditionally to $GITHUB_ENV — DRY_RUN
+          # is deliberately NOT also declared as a job-level env var (a job-level env
+          # entry would compete with this $GITHUB_ENV write for the same name in later
+          # steps), so the "-"-suffixed-tag safety net below cannot be silently discarded.
+          DRY="${REQUESTED_DRY_RUN}"
+          if printf '%s' "${TAG}" | grep -q -- '-'; then
+            DRY=true
+            echo "::notice::tag ${TAG} looks like a pre-release/test tag; forcing dry_run=true regardless of caller"
+          fi
+          echo "DRY_RUN=${DRY}" >> "$GITHUB_ENV"
+          echo "auditing tag=${TAG} src=${SRC_REPO} dry_run=${DRY}"
 
       - name: Guard - check audit self-test status (fail-closed)
         run: |
@@ -48,11 +74,22 @@ jobs:
       - name: Checkout dist repo (for audit-rules)
         uses: actions/checkout@v5.0.0
 
-      - name: Download draft release asset
+      - name: Download release assets from AnroMark-win
+        env:
+          GH_TOKEN: ${{ secrets.WIN_REPO_TOKEN }}
         run: |
           set -u
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::WIN_REPO_TOKEN secret missing — cannot read ${SRC_REPO} releases"; exit 1; }
+          isdraft=$(gh release view "${TAG}" --repo "${SRC_REPO}" --json isDraft --jq '.isDraft') \
+            || { echo "::error::no release ${TAG} on ${SRC_REPO}"; exit 1; }
+          if [ "${isdraft}" != "false" ]; then
+            echo "::error::${SRC_REPO} release ${TAG} is still a draft (draft assets are mutable); refusing"
+            exit 1
+          fi
           mkdir -p ./_dl
-          gh release download "${TAG}" --repo "${{ github.repository }}" -D ./_dl
+          gh release download "${TAG}" --repo "${SRC_REPO}" -D ./_dl --clobber
+          gh release view "${TAG}" --repo "${SRC_REPO}" --json body --jq '.body' > ./_notes.md
+          [ -s ./_notes.md ] || printf 'AnroMark %s\n' "${TAG}" > ./_notes.md
           echo "downloaded files:"
           ls -la ./_dl
 
@@ -61,7 +98,10 @@ jobs:
         run: |
           set -u
           mkdir -p ./_unpack
-          zipfile=$(find ./_dl -maxdepth 1 -type f -iname '*.zip' | head -1)
+          zipfile=$(find ./_dl -maxdepth 1 -type f -name 'AnroMark-v*-win32-x64.zip' | head -1)
+          for want in 'AnroMark-v*-win32-x64.exe' 'AnroMark-v*-win32-x64-portable.exe' 'latest.yml'; do
+            [ -n "$(find ./_dl -maxdepth 1 -type f -name "$want" | head -1)" ] || { echo "::error::missing asset ${want}"; exit 1; }
+          done
           if [ -z "$zipfile" ]; then
             echo "::error::no zip asset found in release ${TAG}"
             exit 1
@@ -102,28 +142,65 @@ jobs:
           new-size: ${{ steps.unpack.outputs.new_size }}
           require-integrity: 'true'
 
-      - name: Publish (PASS path)
+      - name: Publish to dist (PASS path)
         if: steps.audit.outputs.result == 'PASS'
         run: |
-          gh release edit "${TAG}" --repo "${{ github.repository }}" --draft=false
-          echo "::notice::published ${TAG}"
+          set -u
+          REPO="${{ github.repository }}"
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "::notice::DRY RUN — audit PASSED for ${TAG}; would publish $(ls ./_dl | tr '\n' ' ') to ${REPO}"
+            exit 0
+          fi
+          if gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" --repo "${REPO}" --clobber ./_dl/*
+            gh release edit   "${TAG}" --repo "${REPO}" --notes-file ./_notes.md --draft=false
+          else
+            gh release create "${TAG}" --repo "${REPO}" \
+              --target "${{ github.sha }}" \
+              --draft \
+              --title "${TAG}" \
+              --notes-file ./_notes.md \
+              ./_dl/*
+            gh release edit "${TAG}" --repo "${REPO}" --draft=false
+          fi
+          echo "::notice::published ${TAG} to ${REPO}"
 
       - name: Cleanup + alert (FAIL path)
         if: steps.audit.outputs.result != 'PASS'
         env:
           REASON: ${{ steps.audit.outputs.reason }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          WIN_TOKEN: ${{ secrets.WIN_REPO_TOKEN }}
         run: |
           set -u
-          echo "::error::audit FAIL reason=${REASON}; deleting draft ${TAG}"
-          gh release delete "${TAG}" --repo "${{ github.repository }}" --cleanup-tag --yes || true
-          body=$(printf 'Dist repo audit gate rejected tag `%s`.\n\nReason: `%s`\n\nWorkflow run: %s/%s/actions/runs/%s\n\nDraft release was deleted and tag cleaned up. AnroMark CI must re-tag and re-push after fixing the artifact.' \
+          REPO="${{ github.repository }}"
+          echo "::error::audit FAIL reason=${REASON} tag=${TAG}"
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "::warning::DRY RUN — audit FAILed for ${TAG}; leaving dist untouched (no delete), suppressing issue/Discord notification"
+            exit 1
+          fi
+
+          state=$(gh release view "${TAG}" --repo "${REPO}" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)
+          if [ "${state}" = "true" ]; then
+            gh release delete "${TAG}" --repo "${REPO}" --cleanup-tag --yes || true
+          else
+            echo "no dist draft to clean up (state=${state})"
+          fi
+
+          body=$(printf 'Dist audit gate rejected `%s`.\n\nReason: `%s`\n\nAudit run: %s/%s/actions/runs/%s\nSource release: %s/%s/releases/tag/%s\n\nNothing was published to AnroMark-dist. Fix the artifact, then re-cut the release on AnroMark-win (or re-run: `gh workflow run audit-and-publish.yml --repo %s -f tag=%s`).' \
             "${TAG}" "${REASON}" \
-            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
-          gh issue create \
-            --repo Anro-Lab/AnroMark-win \
-            --title "Audit FAIL on dist tag ${TAG}" \
-            --body "${body}" || true
+            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" \
+            "${{ github.server_url }}" "${SRC_REPO}" "${TAG}" "${REPO}" "${TAG}")
+
+          if [ -n "${WIN_TOKEN:-}" ]; then
+            GH_TOKEN="${WIN_TOKEN}" gh issue create --repo "${SRC_REPO}" \
+              --title "Audit FAIL on ${TAG}" --body "${body}" \
+              || echo "::warning::failed to open issue on ${SRC_REPO} (check WIN_REPO_TOKEN issues:write)"
+          else
+            echo "::warning::WIN_REPO_TOKEN unset — skipped cross-repo issue"
+          fi
+
           if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
             payload=$(printf '{"content":"@PM dist audit FAIL: tag=%s reason=%s run=%s/%s/actions/runs/%s"}' \
               "${TAG}" "${REASON}" "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
