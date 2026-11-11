@@ -11,6 +11,7 @@ permissions:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
+    timeout-minutes: 2  # ~3x the longest of the last 30 runs (11s), floored at 2 min
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
