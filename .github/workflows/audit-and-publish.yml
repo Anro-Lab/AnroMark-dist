@@ -37,6 +37,19 @@ jobs:
         env:
           REQUESTED_DRY_RUN: ${{ github.event.client_payload.dry_run || inputs.dry_run || false }}
         run: |
+          # Resolved once, here, and written unconditionally to $GITHUB_ENV — DRY_RUN
+          # is deliberately NOT also declared as a job-level env var (a job-level env
+          # entry would compete with this $GITHUB_ENV write for the same name in later
+          # steps), so the "-"-suffixed-tag safety net below cannot be silently discarded.
+          # It is written BEFORE the tag checks below: if a check rejects the tag, the
+          # FAIL step must still see the caller's dry_run, or a dry run with a bad tag
+          # would open a real issue on the source repo.
+          DRY="${REQUESTED_DRY_RUN}"
+          if printf '%s' "${TAG:-}" | grep -q -- '-'; then
+            DRY=true
+            echo "::notice::tag ${TAG} looks like a pre-release/test tag; forcing dry_run=true regardless of caller"
+          fi
+          echo "DRY_RUN=${DRY}" >> "$GITHUB_ENV"
           if [ -z "${TAG:-}" ]; then
             echo "::error::no tag supplied via client_payload.tag or inputs.tag"
             exit 1
@@ -45,16 +58,6 @@ jobs:
             v[0-9]*.[0-9]*.[0-9]*) : ;;
             *) echo "::error::refusing unexpected tag shape: ${TAG}"; exit 1 ;;
           esac
-          # Resolved once, here, and written unconditionally to $GITHUB_ENV — DRY_RUN
-          # is deliberately NOT also declared as a job-level env var (a job-level env
-          # entry would compete with this $GITHUB_ENV write for the same name in later
-          # steps), so the "-"-suffixed-tag safety net below cannot be silently discarded.
-          DRY="${REQUESTED_DRY_RUN}"
-          if printf '%s' "${TAG}" | grep -q -- '-'; then
-            DRY=true
-            echo "::notice::tag ${TAG} looks like a pre-release/test tag; forcing dry_run=true regardless of caller"
-          fi
-          echo "DRY_RUN=${DRY}" >> "$GITHUB_ENV"
           echo "auditing tag=${TAG} src=${SRC_REPO} dry_run=${DRY}"
 
       - name: Guard - check audit self-test status (fail-closed)
@@ -204,12 +207,22 @@ jobs:
         # and also when the audit finished with a non-PASS result.
         if: failure() || (success() && steps.audit.outputs.result != 'PASS')
         env:
-          REASON: ${{ steps.audit.outputs.reason || 'a step before the audit failed (see the run log)' }}
+          AUDIT_RESULT: ${{ steps.audit.outputs.result }}
+          AUDIT_REASON: ${{ steps.audit.outputs.reason }}
           WIN_TOKEN: ${{ secrets.WIN_REPO_TOKEN }}
         run: |
           set -u
           REPO="${{ github.repository }}"
           TAG="${TAG:-<none>}"
+          # The audit's reason is empty on PASS, so a failure after a PASS can only be
+          # the publish step; anything else without a reason failed before the audit.
+          if [ "${AUDIT_RESULT}" = "PASS" ]; then
+            REASON="the audit passed, but publishing to dist failed (see the run log)"
+            NEXT="A ${TAG} draft left on AnroMark-dist by the failed publish is deleted by this step; a ${TAG} release that was already public is left as it is, so check its assets. Then re-run: \`gh workflow run audit-and-publish.yml --repo ${REPO} -f tag=${TAG}\`."
+          else
+            REASON="${AUDIT_REASON:-a step before the audit failed (see the run log)}"
+            NEXT="Nothing was published to AnroMark-dist. Fix the artifact, then re-cut the release on AnroMark-win (or re-run: \`gh workflow run audit-and-publish.yml --repo ${REPO} -f tag=${TAG}\`)."
+          fi
           echo "::error::audit FAIL reason=${REASON} tag=${TAG}"
 
           if [ "${DRY_RUN:-false}" = "true" ]; then
@@ -228,10 +241,10 @@ jobs:
             *) echo "no valid tag; skipping dist draft cleanup" ;;
           esac
 
-          body=$(printf 'Dist audit gate rejected `%s`.\n\nReason: `%s`\n\nAudit run: %s/%s/actions/runs/%s\nSource release: %s/%s/releases/tag/%s\n\nNothing was published to AnroMark-dist. Fix the artifact, then re-cut the release on AnroMark-win (or re-run: `gh workflow run audit-and-publish.yml --repo %s -f tag=%s`).' \
+          body=$(printf 'Dist audit gate rejected `%s`.\n\nReason: `%s`\n\nAudit run: %s/%s/actions/runs/%s\nSource release: %s/%s/releases/tag/%s\n\n%s' \
             "${TAG}" "${REASON}" \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" \
-            "${{ github.server_url }}" "${SRC_REPO}" "${TAG}" "${REPO}" "${TAG}")
+            "${{ github.server_url }}" "${SRC_REPO}" "${TAG}" "${NEXT}")
 
           if [ -n "${WIN_TOKEN:-}" ]; then
             GH_TOKEN="${WIN_TOKEN}" gh issue create --repo "${SRC_REPO}" \
