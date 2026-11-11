@@ -218,7 +218,7 @@ jobs:
           # the publish step; anything else without a reason failed before the audit.
           if [ "${AUDIT_RESULT}" = "PASS" ]; then
             REASON="the audit passed, but publishing to dist failed (see the run log)"
-            NEXT="Check the ${TAG} release on AnroMark-dist, then re-run: \`gh workflow run audit-and-publish.yml --repo ${REPO} -f tag=${TAG}\`."
+            NEXT="A ${TAG} draft left on AnroMark-dist by the failed publish is deleted by this step; a ${TAG} release that was already public is left as it is, so check its assets. Then re-run: \`gh workflow run audit-and-publish.yml --repo ${REPO} -f tag=${TAG}\`."
           else
             REASON="${AUDIT_REASON:-a step before the audit failed (see the run log)}"
             NEXT="Nothing was published to AnroMark-dist. Fix the artifact, then re-cut the release on AnroMark-win (or re-run: \`gh workflow run audit-and-publish.yml --repo ${REPO} -f tag=${TAG}\`)."
