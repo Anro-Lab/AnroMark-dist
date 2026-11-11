@@ -27,6 +27,7 @@ concurrency:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 4  # ~3x the longest of the last 30 runs (66s)
     env:
       TAG: ${{ github.event.client_payload.tag || inputs.tag }}
       SRC_REPO: Anro-Lab/AnroMark-win
@@ -59,20 +60,26 @@ jobs:
       - name: Guard - check audit self-test status (fail-closed)
         run: |
           set -u
-          conclusion=$(gh run list \
-            --repo "${{ github.repository }}" \
-            --workflow audit-self-test.yml \
-            --limit 1 \
-            --json conclusion \
-            --jq '.[0].conclusion' 2>/dev/null || echo "")
-          echo "last audit-self-test conclusion: '${conclusion}'"
-          if [ "${conclusion}" = "failure" ] || [ "${conclusion}" = "cancelled" ] || [ "${conclusion}" = "timed_out" ]; then
-            echo "::error::audit-self-test is in alarm state (${conclusion}); refusing to publish"
+          # Fail-closed: only a completed run with conclusion "success" passes.
+          # A gh error, no completed run, or an empty result all refuse to publish.
+          if ! conclusion=$(gh run list \
+              --repo "${{ github.repository }}" \
+              --workflow audit-self-test.yml \
+              --status completed \
+              --limit 1 \
+              --json conclusion \
+              --jq '.[0].conclusion // ""'); then
+            echo "::error::could not read the audit-self-test status (gh run list failed); refusing to publish"
+            exit 1
+          fi
+          echo "last completed audit-self-test conclusion: '${conclusion}'"
+          if [ "${conclusion}" != "success" ]; then
+            echo "::error::audit-self-test is not green (conclusion='${conclusion}', empty = no completed run); refusing to publish"
             exit 1
           fi
 
       - name: Checkout dist repo (for audit-rules)
-        uses: actions/checkout@v5.0.0
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
       - name: Download release assets from AnroMark-win
         env:
@@ -120,18 +127,45 @@ jobs:
           # backfilled with an identical createdAt timestamp, which made sort_by(.createdAt)
           # | reverse pick the OLDEST member of that tied group instead of the true latest
           # (e.g. resolved to v0.10.20 instead of v0.10.30), causing false size-policy failures.
-          baseline=$(gh release list --repo "${{ github.repository }}" -L 20 \
-            --json tagName,isDraft,isPrerelease \
-            --jq "[.[] | select(.isDraft==false and .isPrerelease==false and .tagName!=\"${TAG}\")] | map(. + {ver: (.tagName | ltrimstr(\"v\") | split(\"-\")[0] | split(\".\") | map(tonumber))}) | sort_by(.ver) | reverse | .[0].tagName" 2>/dev/null || echo "")
-          if [ -z "$baseline" ] || [ "$baseline" = "null" ]; then
-            echo "no baseline release found"
+          # Only app releases count: tags must be exactly vX.Y.Z. This ignores the
+          # hand-uploaded runtime tags (llama-runtime-*, ollama-runtime-*) and -test.N
+          # prereleases; before this filter the resolver broke on runtime tags and
+          # the size gate was silently skipped. -L 100 keeps old releases in range.
+          # A gh or jq error fails the step; it is never swallowed into "no baseline".
+          if ! releases=$(gh release list --repo "${{ github.repository }}" -L 100 \
+              --json tagName,isDraft,isPrerelease); then
+            echo "::error::baseline lookup failed: gh release list errored on ${{ github.repository }}"
+            exit 1
+          fi
+          if ! baseline=$(printf '%s' "$releases" | jq -r --arg tag "${TAG}" '
+              [.[] | select(.isDraft==false and .isPrerelease==false and .tagName!=$tag
+                            and (.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))]
+              | map(. + {ver: (.tagName | ltrimstr("v") | split(".") | map(tonumber))})
+              | sort_by(.ver) | reverse | .[0].tagName // empty'); then
+            echo "::error::baseline lookup failed: jq could not select a baseline release"
+            exit 1
+          fi
+          if [ -z "$baseline" ]; then
+            echo "::warning::no baseline release found for ${TAG}; size policy will use its no-baseline setting"
             echo "baseline_size=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          size=$(gh release view "$baseline" --repo "${{ github.repository }}" --json assets \
-            --jq '[.assets[] | select(.name | endswith(".zip")) | .size] | first // 0')
-          echo "baseline=$baseline size=$size"
-          echo "baseline_size=$size" >> "$GITHUB_OUTPUT"
+          # Baseline size comes from the Windows zip asset only.
+          asset="AnroMark-${baseline}-win32-x64.zip"
+          if ! assets=$(gh release view "$baseline" --repo "${{ github.repository }}" --json assets); then
+            echo "::error::baseline lookup failed: gh release view ${baseline} errored"
+            exit 1
+          fi
+          if ! size=$(printf '%s' "$assets" | jq -r --arg n "$asset" \
+              '[.assets[] | select(.name==$n) | .size] | first // empty'); then
+            echo "::error::baseline lookup failed: jq could not read the size of ${asset}"
+            exit 1
+          fi
+          if [ -z "$size" ]; then
+            echo "::warning::baseline ${baseline} has no asset ${asset}; size policy will use its no-baseline setting"
+          fi
+          echo "baseline=$baseline asset=$asset size=${size:-none}"
+          echo "baseline_size=${size:-}" >> "$GITHUB_OUTPUT"
 
       - name: Run audit
         id: audit
@@ -166,27 +200,33 @@ jobs:
           echo "::notice::published ${TAG} to ${REPO}"
 
       - name: Cleanup + alert (FAIL path)
-        if: steps.audit.outputs.result != 'PASS'
+        # Runs when any earlier step failed (e.g. win release missing, download error)
+        # and also when the audit finished with a non-PASS result.
+        if: failure() || (success() && steps.audit.outputs.result != 'PASS')
         env:
-          REASON: ${{ steps.audit.outputs.reason }}
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REASON: ${{ steps.audit.outputs.reason || 'a step before the audit failed (see the run log)' }}
           WIN_TOKEN: ${{ secrets.WIN_REPO_TOKEN }}
         run: |
           set -u
           REPO="${{ github.repository }}"
+          TAG="${TAG:-<none>}"
           echo "::error::audit FAIL reason=${REASON} tag=${TAG}"
 
-          if [ "${DRY_RUN}" = "true" ]; then
-            echo "::warning::DRY RUN — audit FAILed for ${TAG}; leaving dist untouched (no delete), suppressing issue/Discord notification"
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            echo "::warning::DRY RUN — audit FAILed for ${TAG}; leaving dist untouched (no delete), suppressing issue notification"
             exit 1
           fi
 
-          state=$(gh release view "${TAG}" --repo "${REPO}" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)
-          if [ "${state}" = "true" ]; then
-            gh release delete "${TAG}" --repo "${REPO}" --cleanup-tag --yes || true
-          else
-            echo "no dist draft to clean up (state=${state})"
-          fi
+          case "${TAG}" in
+            v[0-9]*.[0-9]*.[0-9]*)
+              state=$(gh release view "${TAG}" --repo "${REPO}" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)
+              if [ "${state}" = "true" ]; then
+                gh release delete "${TAG}" --repo "${REPO}" --cleanup-tag --yes || true
+              else
+                echo "no dist draft to clean up (state=${state})"
+              fi ;;
+            *) echo "no valid tag; skipping dist draft cleanup" ;;
+          esac
 
           body=$(printf 'Dist audit gate rejected `%s`.\n\nReason: `%s`\n\nAudit run: %s/%s/actions/runs/%s\nSource release: %s/%s/releases/tag/%s\n\nNothing was published to AnroMark-dist. Fix the artifact, then re-cut the release on AnroMark-win (or re-run: `gh workflow run audit-and-publish.yml --repo %s -f tag=%s`).' \
             "${TAG}" "${REASON}" \
@@ -196,16 +236,8 @@ jobs:
           if [ -n "${WIN_TOKEN:-}" ]; then
             GH_TOKEN="${WIN_TOKEN}" gh issue create --repo "${SRC_REPO}" \
               --title "Audit FAIL on ${TAG}" --body "${body}" \
-              || echo "::warning::failed to open issue on ${SRC_REPO} (check WIN_REPO_TOKEN issues:write)"
+              || echo "::error::failed to open issue on ${SRC_REPO} (check WIN_REPO_TOKEN issues:write)"
           else
-            echo "::warning::WIN_REPO_TOKEN unset — skipped cross-repo issue"
-          fi
-
-          if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
-            payload=$(printf '{"content":"@PM dist audit FAIL: tag=%s reason=%s run=%s/%s/actions/runs/%s"}' \
-              "${TAG}" "${REASON}" "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
-            curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL" || true
-          else
-            echo "DISCORD_WEBHOOK_URL not set; skipped Discord alert"
+            echo "::error::WIN_REPO_TOKEN unset — no issue opened on ${SRC_REPO}"
           fi
           exit 1

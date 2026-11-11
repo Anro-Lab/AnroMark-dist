@@ -17,13 +17,15 @@ permissions:
 jobs:
   size-policy-unit:
     runs-on: ubuntu-latest
+    timeout-minutes: 3  # ~3x the longest of the last 30 workflow runs (46s)
     steps:
-      - uses: actions/checkout@v5.0.0
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
       - name: Run size_policy_test.sh
         run: bash audit-rules/size_policy_test.sh
 
   metamorphic:
     runs-on: ubuntu-latest
+    timeout-minutes: 3  # ~3x the longest of the last 30 workflow runs (46s)
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +43,7 @@ jobs:
             zip: audit-rules/fixtures/dirty-env.zip
             expected: FAIL
     steps:
-      - uses: actions/checkout@v5.0.0
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
       - name: Unpack fixture
         id: unpack
@@ -76,26 +78,23 @@ jobs:
 
   alarm-on-failure:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     needs: [metamorphic, size-policy-unit]
     if: failure()
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      # The alarm issue lives on AnroMark-win, so it needs the cross-repo token
+      # (the dist GITHUB_TOKEN cannot open issues there).
+      GH_TOKEN: ${{ secrets.WIN_REPO_TOKEN }}
     steps:
-      - name: Open alarm issue + Discord alert
+      - name: Open alarm issue
         run: |
           set -u
+          [ -n "${GH_TOKEN:-}" ] || { echo "::error::WIN_REPO_TOKEN secret missing - cannot open the alarm issue"; exit 1; }
           body=$(printf 'audit-self-test failed in dist repo. A metamorphic invariant was violated, meaning the audit gate is no longer trustworthy.\n\nWorkflow run: %s/%s/actions/runs/%s\n\n`audit-and-publish` will refuse to publish anything until self-test passes again.' \
             "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
+          # No --label: AnroMark-win has no "critical" label, and a missing label
+          # would make this create fail. A failed create now fails the job loudly.
           gh issue create \
             --repo Anro-Lab/AnroMark-win \
             --title "AUDIT-WORKFLOW-BROKEN dist repo alarm" \
-            --label "critical" \
-            --body "${body}" || true
-          if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
-            payload=$(printf '{"content":"@PM AUDIT-WORKFLOW-BROKEN: dist repo alarm. run=%s/%s/actions/runs/%s"}' \
-              "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
-            curl -sS -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL" || true
-          else
-            echo "DISCORD_WEBHOOK_URL not set; skipped Discord alert"
-          fi
+            --body "${body}"

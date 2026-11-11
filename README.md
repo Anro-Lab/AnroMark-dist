@@ -8,27 +8,39 @@ This repository is a write-only distribution endpoint. It hosts the Windows desk
 
 - **No source code lives here.** Source repo: [`Anro-Lab/AnroMark-win`](https://github.com/Anro-Lab/AnroMark-win).
 - **Anonymous read** is allowed — end users do not need GitHub credentials.
-- **Issues are disabled here.** Report problems to the source repo:
-  https://github.com/Anro-Lab/AnroMark-win/issues
+- **Issues are enabled here, but product problems belong in the source repo:**
+  https://github.com/Anro-Lab/AnroMark-win/issues. Audit failures are reported there too, not here.
 
 ## Release Flow
 
+Stable releases (`vX.Y.Z`) are published to this repo **only by CI**:
+
 ```
-build-electron-complete.bat (local, AnroMark-win)
-    └─> git commit + push main + tag vX.Y.Z → AnroMark-win
-    └─> push DRAFT release to this repo (ZIP + NSIS installer + portable + latest.yml)
-    └─> gh workflow run audit-and-publish.yml --field tag=vX.Y.Z
+AnroMark-win production build (build-electron-complete.bat, production mode)
+    └─> creates release vX.Y.Z on Anro-Lab/AnroMark-win
+        (ZIP + NSIS installer + portable + latest.yml)
+    └─> AnroMark-win .github/workflows/notify-dist-release.yml
+        sends repository_dispatch `audit_release` to this repo
                           │
                           ▼
-    .github/workflows/audit-and-publish.yml
-        1. Guard: refuse if audit-self-test is in alarm state
-        2. Download ALL draft assets (zip + exe + portable + latest.yml)
-        3. Run audit gate on the ZIP
-        4. PASS  -> gh release edit --draft=false (publish, all assets included)
-           FAIL  -> gh release delete --cleanup-tag + open issue + Discord alert
+    .github/workflows/audit-and-publish.yml (this repo)
+        1. Guard: refuse unless the last completed audit-self-test run succeeded
+        2. Download the release assets from the AnroMark-win release
+           (must exist and must not be a draft)
+        3. Run the audit gate: forbidden paths, gitleaks, trufflehog,
+           size policy, integrity
+        4. PASS  -> publish vX.Y.Z here (all assets)
+           FAIL  -> nothing is published; an issue is opened on AnroMark-win
 ```
 
+Any step failing before the audit (release not found, download error, ...) also opens the issue on AnroMark-win. A manual dry run is possible with `gh workflow run audit-and-publish.yml -f tag=vX.Y.Z -f dry_run=true`: it audits but publishes nothing and opens no issue. Tags containing `-` are always forced to dry run.
+
 Stale drafts (>24h, never published) are cleaned by `stale-draft-cleanup.yml` daily.
+
+### Exceptions to "stable releases come only from CI"
+
+- **Runtime tags** (`ollama-runtime-*`, `llama-runtime-*`) are uploaded **by hand**. They hold upstream binaries and do not go through the audit gate. Integrity is enforced by the SHA-256 pins that the app checks before using a download: `electron/src/services/ollama-pins.json` in AnroMark-win (for `ollama-runtime-*`). There is no pins file for `llama-runtime-*` in AnroMark-win yet.
+- **Test prereleases** (`vX.Y.Z-test.N`, beta channel) are **today uploaded directly to this repo by the build script in test mode, without this audit**. Moving them behind the audit is planned but not done.
 
 ## Audit Gate Summary
 
@@ -37,10 +49,10 @@ Stale drafts (>24h, never published) are cleaned by `stale-draft-cleanup.yml` da
 | Secret scan | gitleaks (`audit-rules/gitleaks.toml`) + trufflehog (verified only) | Any hit -> FAIL |
 | Service-account JSON | Custom regex `"type"\s*:\s*"service_account"` + `*-firebase-adminsdk-*.json` | Hit -> FAIL |
 | Forbidden paths | `audit-rules/forbidden-paths.txt` (`*.ts`, `*.env`, `src/`, `*.pem`, `*.key`, `tsconfig.json`, `.git/`) | Hit -> FAIL |
-| Size policy | `audit-rules/size-policy.yml` (warn >=50%, fail >=100% delta vs previous release; first release skipped) | >=100% -> FAIL |
+| Size policy | `audit-rules/size-policy.yml` (warn >=50%, fail >=100% delta of the ZIP vs the previous stable `vX.Y.Z` release's ZIP; runtime and test tags are ignored; skipped with a warning annotation if no baseline exists) | >=100% -> FAIL |
 | Integrity | Must contain `win-unpacked/` dir + `.exe` + `resources/app.asar` (Electron structure) | Missing -> FAIL |
 
-The audit workflow is itself protected by a daily metamorphic self-test (`audit-self-test.yml`) that runs the gate against fixed clean / dirty fixtures. If a known-dirty fixture ever passes, the repo enters an **alarm state** and `audit-and-publish` refuses to publish anything until fixed.
+The audit runs on the unpacked ZIP only. The audit workflow is itself protected by a metamorphic self-test (`audit-self-test.yml`, daily and on pushes touching the audit files) that runs the gate against fixed clean / dirty fixtures. If a fixture gives the wrong result, the self-test fails, an alarm issue is opened on AnroMark-win, and `audit-and-publish` refuses to publish until the last completed self-test run is green (a missing or unreadable result also blocks publishing).
 
 ## Version Mapping
 
@@ -52,13 +64,12 @@ For any tag `vX.Y.Z`:
 ## Policies
 
 - **No source code.** PRs adding `.go`, `.ts`, `.tsx`, `.py`, `.js`, or any `src/` content will be rejected.
-- **No issues.** Issues are filed in the source repo (link above).
-- **Direct push to `main` is blocked.** Branch protection requires PR + review.
-- **Releases are created exclusively via the AnroMark CI PAT bot.** Manual release creation by humans is disallowed by policy.
+- **Issues about the product are filed in the source repo** (link above).
+- **Stable releases are created only by the `audit-and-publish` workflow.** Manual creation of a stable `vX.Y.Z` release is against policy. The only exceptions are the hand-uploaded runtime tags and the directly uploaded test prereleases described under Release Flow.
 
 ## Release Asset Format
 
-Each published release contains **four assets**:
+Each stable release (`vX.Y.Z`) contains **four assets**. Test prereleases (`vX.Y.Z-test.N`) carry the same four, except that the channel file is `beta.yml` instead of `latest.yml`, plus the sideload packages `AnroMark-vX.Y.Z-test.N-win32-x64.msix` / `.appx` (and `AnroMark-codesign.cer` for signed builds). The stable channel file is `latest.yml`.
 
 ### 1. `AnroMark-vX.Y.Z-win32-x64.zip` — App bundle for the Go Launcher
 
@@ -107,7 +118,9 @@ releaseDate: 'YYYY-MM-DDTHH:MM:SS.sssZ'
 
 ## Release Notes
 
-### v0.10.17
+> Historical notes. This section records an old release (v0.10.17) and does not describe the current flow. Current release notes live on each GitHub release.
+
+### v0.10.17 (history)
 
 **Auto-Update Flow Fixes** — resolved multiple issues that prevented in-app updates from completing:
 
